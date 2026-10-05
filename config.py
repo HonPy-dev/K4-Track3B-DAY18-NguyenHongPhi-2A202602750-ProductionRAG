@@ -3,7 +3,9 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True: .env (key thật) thắng biến môi trường hệ thống
+# (tránh máy có OPENAI_API_KEY placeholder sẵn trong env làm pipeline 401).
+load_dotenv(override=True)
 
 # --- API Keys ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
