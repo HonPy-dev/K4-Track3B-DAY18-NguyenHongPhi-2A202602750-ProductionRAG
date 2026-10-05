@@ -15,7 +15,7 @@ from src.m2_search import HybridSearch
 from src.m3_rerank import CrossEncoderReranker
 from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_report
 from src.m5_enrichment import enrich_chunks
-from config import RERANK_TOP_K
+from config import RERANK_TOP_K, LLM_MODEL
 
 
 def build_pipeline():
@@ -29,8 +29,12 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    parent_map = {}  # (source, parent_id) → parent text (retrieve child → return parent)
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        source = doc["metadata"].get("source", "")
+        for p in parents:
+            parent_map[(source, p.metadata.get("parent_id"))] = p.text
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
@@ -58,6 +62,7 @@ def build_pipeline():
     reranker = CrossEncoderReranker()
     print(f"  ✓ Reranker ready ({time.time()-t0:.1f}s)", flush=True)
 
+    search.parent_map = parent_map
     return search, reranker
 
 
@@ -66,7 +71,13 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+
+    # Retrieve child (precision) → return parent (context đầy đủ cho LLM)
+    parent_map = getattr(search, "parent_map", {})
+    def _to_context(r):
+        meta = r.metadata or {}
+        return parent_map.get((meta.get("source"), meta.get("parent_id")), r.text)
+    contexts = [_to_context(r) for r in reranked] if reranked else [_to_context(r) for r in results[:3]]
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
@@ -74,7 +85,7 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             from openai import OpenAI
             client = OpenAI()
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
+            resp = client.chat.completions.create(model=LLM_MODEL, temperature=0.1, messages=[
                 {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
             ])
@@ -103,6 +114,17 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
 
     t0 = time.time()
     print(f"\n[Eval] Running RAGAS (4 metrics × {len(test_set)} questions)...", flush=True)
+    # Giải phóng 2 model lớn của retrieval (bge-m3 + reranker ~4.2GB) trước khi
+    # RAGAS nạp bản embeddings riêng — tránh 3 model lớn cùng lúc trên máy ít RAM.
+    import gc
+    from src.m2_search import DenseSearch
+    from src.m3_rerank import CrossEncoderReranker
+    DenseSearch._shared_encoder = None
+    search.dense._encoder = None
+    CrossEncoderReranker._shared_model = None
+    reranker._model = None
+    gc.collect()
+
     results = evaluate_ragas(questions, answers, all_contexts, ground_truths)
     print(f"  ✓ RAGAS done ({time.time()-t0:.1f}s)", flush=True)
 
